@@ -15,10 +15,10 @@ from torch.utils.data import DataLoader
 
 from util.util import enumerateWithEstimate
 from segmentation_model.dsets import Luna2dSegmentationDataset
-from classification_model.dsets import LunaDataset, getCt, getCandidateInfoDict, getCandidateInfoList, CandidateInfoTuple
+from malignancy_classification_model.dsets import LunaDataset, getCt, getCandidateInfoDict, getCandidateInfoList, CandidateInfoTuple
 from segmentation_model.model import UNetWrapper
 
-import classification_model.model
+import malignancy_classification_model.model
 
 from util.logconf import logging
 from util.util import xyz2irc, irc2xyz
@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 # log.setLevel(logging.INFO)
 log.setLevel(logging.DEBUG)
 logging.getLogger("segmentation_model.dsets").setLevel(logging.WARNING)
-logging.getLogger("classification_model.dsets").setLevel(logging.WARNING)
+logging.getLogger("malignancy_classification_model.dsets").setLevel(logging.WARNING)
 
 def print_confusion(label, confusions, do_mal):
     row_labels = ['Non-Nodules', 'Benign', 'Malignant']
@@ -37,8 +37,8 @@ def print_confusion(label, confusions, do_mal):
         col_labels = ['', 'Complete Miss', 'Filtered Out', 'Pred. Benign', 'Pred. Malignant']
     else:
         col_labels = ['', 'Complete Miss', 'Filtered Out', 'Pred. Nodule']
-        confusions[:, -2] += confusions[:, -1]
-        confusions = confusions[:, :-1]
+        confusions[:, -2] += confusions[:, -1] # add last column value to the column before it
+        confusions = confusions[:, :-1] # exclude last column
     cell_width = 16
     f = '{:>' + str(cell_width) + '}'
     print(label)
@@ -51,7 +51,9 @@ def print_confusion(label, confusions, do_mal):
 
 def match_and_score(detections, truth, threshold=0.5, threshold_mal=0.5):
     # Returns 3x4 confusion matrix for:
+    # Rows:            0         1         2
     # Rows: Truth: Non-Nodules, Benign, Malignant
+    # Columns:    0             1               2                        3
     # Cols: Not Detected, Detected by Seg, Detected as Benign, Detected as Malignant
     # If one true nodule matches multiple detections, the "highest" detection is considered
     # If one detection matches several true nodule annotations, it counts for all of them
@@ -68,7 +70,7 @@ def match_and_score(detections, truth, threshold=0.5, threshold_mal=0.5):
                                  else (2 if d[1] < threshold
                                        else 3) for d in detections])
 
-    confusion = np.zeros((3, 4), dtype=int)
+    confusion = np.zeros((3, 4), dtype=int) 
     if len(detected_xyz) == 0:
         for tn in true_nodules:
             confusion[2 if tn.isMal_bool else 1, 0] += 1
@@ -76,19 +78,27 @@ def match_and_score(detections, truth, threshold=0.5, threshold_mal=0.5):
         for dc in detected_classes:
             confusion[0, dc] += 1
     else:
-        normalized_dists = np.linalg.norm(truth_xyz[:, None] - detected_xyz[None], ord=2, axis=-1) / truth_diams[:, None]
+        #truth_xyz shape is (n,3), truth_xyz[:, None] shape is (n,1,3) 
+        #detected_xyz shape is (m,3), detected_xyz[None] shape is (1,m,3) 
+        #truth_diams shape is (n), truth_diams[:, None] shape is (n,1)
+        normalized_dists = np.linalg.norm(truth_xyz[:, None] - detected_xyz[None], ord=2, axis=-1) / truth_diams[:, None] #Computes the Euclidean distance between each ground truth nodule and each detected nodule. and Normalizes the distances by the corresponding ground truth nodule's diameter.
+        # The result has shape (n, m)
+        # Each entry represents a normalized Euclidean distance between a ground truth nodule and a detected nodule,
+        # divided by the ground truth's diameter in each axis.
         matches = (normalized_dists < 0.7)
         unmatched_detections = np.ones(len(detections), dtype=bool)
         matched_true_nodules = np.zeros(len(true_nodules), dtype=int)
-        for i_tn, i_detection in zip(*matches.nonzero()):
+        for i_tn, i_detection in zip(*matches.nonzero()): # iterate over the indices of True values only
             matched_true_nodules[i_tn] = max(matched_true_nodules[i_tn], detected_classes[i_detection])
             unmatched_detections[i_detection] = False
 
         for ud, dc in zip(unmatched_detections, detected_classes):
             if ud:
                 confusion[0, dc] += 1
+
         for tn, dc in zip(true_nodules, matched_true_nodules):
             confusion[2 if tn.isMal_bool else 1, dc] += 1
+
     return confusion
 
 class NoduleAnalysisApp:
@@ -123,7 +133,7 @@ class NoduleAnalysisApp:
         parser.add_argument('--segmentation-path',
             help="Path to the saved segmentation model",
             nargs='?',
-            default='data/part2/models/seg_2020-01-26_19.45.12_w4d3c1-bal_1_nodupe-label_pos-d1_fn8-adam.best.state',
+            default='data/models/seg_2020-01-26_19.45.12_w4d3c1-bal_1_nodupe-label_pos-d1_fn8-adam.best.state',
         )
 
         parser.add_argument('--cls-model',
@@ -134,7 +144,7 @@ class NoduleAnalysisApp:
         parser.add_argument('--classification-path',
             help="Path to the saved classification model",
             nargs='?',
-            default='data/part2/models/cls_2020-02-06_14.16.55_final-nodule-nonnodule.best.state',
+            default='data/models/cls_2020-02-06_14.16.55_final-nodule-nonnodule.best.state',
         )
 
         parser.add_argument('--malignancy-model',
@@ -150,7 +160,7 @@ class NoduleAnalysisApp:
         )
 
         parser.add_argument('--tb-prefix',
-            default='classification_model',
+            default='malignancy_classification_model',
             help="Data prefix to use for Tensorboard run. Defaults to chapter.",
         )
 
@@ -163,7 +173,7 @@ class NoduleAnalysisApp:
         self.cli_args = parser.parse_args(sys_argv)
         # self.time_str = datetime.datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
 
-        if not (bool(self.cli_args.series_uid) ^ self.cli_args.run_validation): # xor after applying not it becomes nor --> return true of both the same
+        if not (bool(self.cli_args.series_uid) ^ self.cli_args.run_validation): # xor after applying not it becomes nor --> return true if both are the same
             raise Exception("One and only one of series_uid and --run-validation should be given")
 
 
@@ -181,7 +191,6 @@ class NoduleAnalysisApp:
     def initModelPath(self, type_str):
         local_path = os.path.join(
             'data',
-            'part2',
             'models',
             'segmentation_model',#self.cli_args.tb_prefix,
             type_str + '_{}_{}.{}.state'.format('*', '*', 'best'),
@@ -191,7 +200,6 @@ class NoduleAnalysisApp:
         if not file_list:
             pretrained_path = os.path.join(
                 'data',
-                'part2',
                 'models',
                 type_str + '_{}_{}.{}.state'.format('*', '*', '*'),
             )
@@ -227,7 +235,7 @@ class NoduleAnalysisApp:
         log.debug(self.cli_args.classification_path)
         cls_dict = torch.load(self.cli_args.classification_path,map_location=self.device)
 
-        model_cls = getattr(classification_model.model, self.cli_args.cls_model)
+        model_cls = getattr(malignancy_classification_model.model, self.cli_args.cls_model)
         cls_model = model_cls()
         cls_model.load_state_dict(cls_dict['model_state'])
         cls_model.eval()
@@ -241,7 +249,7 @@ class NoduleAnalysisApp:
             cls_model.to(self.device)
 
         if self.cli_args.malignancy_path:
-            model_cls = getattr(classification_model.model, self.cli_args.malignancy_model)
+            model_cls = getattr(malignancy_classification_model.model, self.cli_args.malignancy_model)
             malignancy_model = model_cls()
             malignancy_dict = torch.load(self.cli_args.malignancy_path)
             malignancy_model.load_state_dict(malignancy_dict['model_state'])
