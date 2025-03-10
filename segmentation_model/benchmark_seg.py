@@ -15,11 +15,11 @@ from torch.optim import SGD, Adam
 from torch.utils.data import DataLoader
 
 from util.util import enumerateWithEstimate
-from segmentation_model.dsets import Luna2dSegmentationDataset, TrainingLuna2dSegmentationDataset, getCt
+from p2ch13.dsets import Luna2dSegmentationDataset, TrainingLuna2dSegmentationDataset, getCt
 from util.logconf import logging
 from util.util import xyz2irc
-from segmentation_model.model_seg import UNetWrapper, SegmentationAugmentation
-from segmentation_model.train_seg import LunaTrainingApp
+from p2ch13.model_seg import UNetWrapper, SegmentationAugmentation
+from p2ch13.train_seg import LunaTrainingApp
 
 log = logging.getLogger(__name__)
 # log.setLevel(logging.WARN)

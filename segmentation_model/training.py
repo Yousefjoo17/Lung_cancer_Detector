@@ -95,8 +95,8 @@ class SegmentationTrainingApp:
         )
 
         parser.add_argument('--tb-prefix',
-            default='p2ch13',
-            help="Data prefix to use for Tensorboard run. Defaults to chapter.",
+            default='sgementation',
+            help="Data prefix to use for Tensorboard run. Defaults to segmentation.",
         )
 
         parser.add_argument('comment',
@@ -132,13 +132,13 @@ class SegmentationTrainingApp:
 
     def initModel(self):
         segmentation_model = UNetWrapper(
-            in_channels=7,
-            n_classes=1,
-            depth=3,
-            wf=4,
-            padding=True,
-            batch_norm=True,
-            up_mode='upconv',
+            in_channels=7, # we have seven channels (slices) input 3 + 3 context slices, and 1 slice that is the focus for what we’re actually segmenting
+            n_classes=1, # We have one output class indicating whether each voxel is part of a nodule
+            depth=3, #The depth parameter controls how deep the U goes; each downsampling operation adds 1 to the depth. 
+            wf=4, # Using wf=4 means the first layer will have 2**wf == 16 filters, which doubles with each downsampling.
+            padding=True, #We wantthe convolutions to be padded so that we get an output image the same size as our input.
+            batch_norm=True, #We also want batch normalization inside the network after each activation function
+            up_mode='upconv', 
         )
 
         augmentation_model = SegmentationAugmentation(**self.augmentation_dict)
@@ -150,6 +150,12 @@ class SegmentationTrainingApp:
                 augmentation_model = nn.DataParallel(augmentation_model)
             segmentation_model = segmentation_model.to(self.device)
             augmentation_model = augmentation_model.to(self.device)
+            # Moving the model to the GPU using augmentation_model.to(self.device)
+            # only ensures that the model's parameters (e.g., weights, biases) and
+            # buffers e.g., running mean/variance for BatchNorm) are on the GPU,they are stored in GPU memory (VRAM).. 
+            # It does not automatically move all tensors used in the forward pass to the GPU.
+            # You still need to ensure that all input tensors like input_batch and transform_t are on the GPU
+            # if you want to avoid CPU-GPU data transfer overhead.
 
         return segmentation_model, augmentation_model
 
@@ -225,8 +231,9 @@ class SegmentationTrainingApp:
                 (torch.cuda.device_count() if self.use_cuda else 1),
             ))
 
-            trnMetrics_t = self.doTraining(epoch_ndx, train_dl)
-            self.logMetrics(epoch_ndx, 'trn', trnMetrics_t)
+           
+            trnMetrics_t = self.doTraining(epoch_ndx, train_dl) #Trains for one epoch
+            self.logMetrics(epoch_ndx, 'trn', trnMetrics_t) #Logs the (scalar) metrics from training after each epoch
 
             if epoch_ndx == 1 or epoch_ndx % self.validation_cadence == 0:
                 # if validation is wanted
@@ -243,7 +250,7 @@ class SegmentationTrainingApp:
         self.val_writer.close()
 
     def doTraining(self, epoch_ndx, train_dl):
-        trnMetrics_g = torch.zeros(METRICS_SIZE, len(train_dl.dataset), device=self.device)
+        trnMetrics_g = torch.zeros(METRICS_SIZE, len(train_dl.dataset), device=self.device) #If your model and outputs are on the GPU, any tensors that interact with the model's outputs (such as metrics, losses, or predictions) should also be on the GPU for efficient computation.self.segmentation_model.eval()
         self.segmentation_model.train()
         train_dl.dataset.shuffleSamples()
 
@@ -262,11 +269,11 @@ class SegmentationTrainingApp:
 
         self.totalTrainingSamples_count += trnMetrics_g.size(1)
 
-        return trnMetrics_g.to('cpu')
+        return trnMetrics_g.to('cpu') # if trnMetrics_g is not involved in further GPU computations, keeping it on the GPU is redundant. no need to consume GPU memory
 
     def doValidation(self, epoch_ndx, val_dl):
         with torch.no_grad():
-            valMetrics_g = torch.zeros(METRICS_SIZE, len(val_dl.dataset), device=self.device)
+            valMetrics_g = torch.zeros(METRICS_SIZE, len(val_dl.dataset), device=self.device) #If your model and outputs are on the GPU, any tensors that interact with the model's outputs (such as metrics, losses, or predictions) should also be on the GPU for efficient computation.
             self.segmentation_model.eval()
 
             batch_iter = enumerateWithEstimate(
@@ -277,22 +284,23 @@ class SegmentationTrainingApp:
             for batch_ndx, batch_tup in batch_iter:
                 self.computeBatchLoss(batch_ndx, batch_tup, val_dl.batch_size, valMetrics_g)
 
-        return valMetrics_g.to('cpu')
+        return valMetrics_g.to('cpu') #if valMetrics_g is not involved in further GPU computations, keeping it on the GPU is redundant. no need to consume GPU memory
 
     def computeBatchLoss(self, batch_ndx, batch_tup, batch_size, metrics_g,
                          classificationThreshold=0.5):
         input_t, label_t, series_list, _slice_ndx_list = batch_tup
+        #input shape: (7,w,h), label shape: (1,w,h)
 
         input_g = input_t.to(self.device, non_blocking=True)
         label_g = label_t.to(self.device, non_blocking=True)
 
-        if self.segmentation_model.training and self.augmentation_dict:
+        if self.segmentation_model.training and self.augmentation_dict: #  Augments as needed if we are training.In validation, we would skip this.
             input_g, label_g = self.augmentation_model(input_g, label_g)
 
-        prediction_g = self.segmentation_model(input_g)
+        prediction_g = self.segmentation_model(input_g) # prediction_g shape is (batch_size, 1, 512, 512), while input_g is (batch size, 7, w, h)
 
-        diceLoss_g = self.diceLoss(prediction_g, label_g)
-        fnLoss_g = self.diceLoss(prediction_g * label_g, label_g)
+        diceLoss_g = self.diceLoss(prediction_g, label_g) # Normal Dice loss: Measures how well the model’s predictions match the ground truth labels overall.
+        fnLoss_g = self.diceLoss(prediction_g * label_g, label_g) #False Neagtive Dice Loss: Focuses only on the pixels that the model missed (false negatives). This is important because detecting all relevant pixels (e.g., tumors) is critical for the task.
 
         start_ndx = batch_ndx * batch_size
         end_ndx = start_ndx + input_t.size(0)
@@ -312,7 +320,7 @@ class SegmentationTrainingApp:
 
         return diceLoss_g.mean() + fnLoss_g.mean() * 8
 
-    def diceLoss(self, prediction_g, label_g, epsilon=1):
+    def diceLoss(self, prediction_g, label_g, epsilon=1): #Instead of treating predictions as strict "yes" or "no" (1 or 0), we use the predicted probabilities (values between 0 and 1).
         diceLabel_g = label_g.sum(dim=[1,2,3])
         dicePrediction_g = prediction_g.sum(dim=[1,2,3])
         diceCorrect_g = (prediction_g * label_g).sum(dim=[1,2,3])
@@ -326,7 +334,7 @@ class SegmentationTrainingApp:
     def logImages(self, epoch_ndx, mode_str, dl):
         self.segmentation_model.eval()
 
-        images = sorted(dl.dataset.series_list)[:12]
+        images = sorted(dl.dataset.series_list)[:12] # Takes (the same) 12 CTs by bypassing the data loader and using the dataset directly. The series list might be shuffled, so we sort.
         for series_ndx, series_uid in enumerate(images):
             ct = getCt(series_uid)
 
@@ -335,21 +343,21 @@ class SegmentationTrainingApp:
                 sample_tup = dl.dataset.getitem_fullSlice(series_uid, ct_ndx)
 
                 ct_t, label_t, series_uid, ct_ndx = sample_tup
-
-                input_g = ct_t.to(self.device).unsqueeze(0)
-                label_g = pos_g = label_t.to(self.device).unsqueeze(0)
+                #ct_t shape is (7,512,512)
+                input_g = ct_t.to(self.device).unsqueeze(0) # input_g shape: (1,7,512,512)
+                label_g = pos_g = label_t.to(self.device).unsqueeze(0) # label_g shape: (1,512,512)
 
                 prediction_g = self.segmentation_model(input_g)[0]
                 prediction_a = prediction_g.to('cpu').detach().numpy()[0] > 0.5
-                label_a = label_g.cpu().numpy()[0][0] > 0.5
+                label_a = label_g.cpu().numpy()[0][0] > 0.5 # remove batch and channel dimensions
 
-                ct_t[:-1,:,:] /= 2000
-                ct_t[:-1,:,:] += 0.5
+                ct_t[:-1,:,:] /= 2000 
+                ct_t[:-1,:,:] += 0.5 
 
-                ctSlice_a = ct_t[dl.dataset.contextSlices_count].numpy()
+                ctSlice_a = ct_t[dl.dataset.contextSlices_count].numpy() #Ct_t[3].numpy()
 
                 image_a = np.zeros((512, 512, 3), dtype=np.float32)
-                image_a[:,:,:] = ctSlice_a.reshape((512,512,1))
+                image_a[:,:,:] = ctSlice_a.reshape((512,512,1)) #Each pixel value in ctSlice_a is copied into all three color channels (R, G, and B) of image_a: image_a becomes an RGB-like representation where all three color channels contain identical values derived from ctSlice_a.
                 image_a[:,:,0] += prediction_a & (1 - label_a)
                 image_a[:,:,0] += (1 - prediction_a) & label_a
                 image_a[:,:,1] += ((1 - prediction_a) & label_a) * 0.5
@@ -400,7 +408,7 @@ class SegmentationTrainingApp:
         sum_a = metrics_a.sum(axis=1)
         assert np.isfinite(metrics_a).all()
 
-        allLabel_count = sum_a[METRICS_TP_NDX] + sum_a[METRICS_FN_NDX]
+        allLabel_count = sum_a[METRICS_TP_NDX] + sum_a[METRICS_FN_NDX] #total number of pixels in the image that are labeled as candidate nodules
 
         metrics_dict = {}
         metrics_dict['loss/all'] = metrics_a[METRICS_LOSS_NDX].mean()
@@ -479,8 +487,7 @@ class SegmentationTrainingApp:
 
     def saveModel(self, type_str, epoch_ndx, isBest=False):
         file_path = os.path.join(
-            'data-unversioned',
-            'part2',
+            'data',
             'models',
             self.cli_args.tb_prefix,
             '{}_{}_{}.{}.state'.format(
@@ -513,7 +520,7 @@ class SegmentationTrainingApp:
 
         if isBest:
             best_path = os.path.join(
-                'data-unversioned', 'part2', 'models',
+                'data', 'models',
                 self.cli_args.tb_prefix,
                 f'{type_str}_{self.time_str}_{self.cli_args.comment}.best.state')
             shutil.copyfile(file_path, best_path)

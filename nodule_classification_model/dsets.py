@@ -25,48 +25,34 @@ log = logging.getLogger(__name__)
 # log.setLevel(logging.INFO)
 log.setLevel(logging.DEBUG)
 
-raw_cache = getCache('part2ch14_raw')
+raw_cache = getCache('nodule_cls_raw')
 
-CandidateInfoTuple = namedtuple(
-    'CandidateInfoTuple',
-    'isNodule_bool, hasAnnotation_bool, isMal_bool, diameter_mm, series_uid, center_xyz',
-)
-MaskTuple = namedtuple(
-    'MaskTuple',
-    'raw_dense_mask, dense_mask, body_mask, air_mask, raw_candidate_mask, candidate_mask, lung_mask, neg_mask, pos_mask',
-)
+CandidateInfoTuple = namedtuple('CandidateInfoTuple', 'isNodule_bool, diameter_mm, series_uid, center_xyz')
 
 @functools.lru_cache(1)
 def getCandidateInfoList(requireOnDisk_bool=True):
     # We construct a set with all series_uids that are present on disk.
     # This will let us use the data, even if we haven't downloaded all of
     # the subsets yet.
-    mhd_list = glob.glob('data-unversioned/part2/luna/subset*/*.mhd')
+    mhd_list = glob.glob('data/luna/subset*/*.mhd')
     presentOnDisk_set = {os.path.split(p)[-1][:-4] for p in mhd_list}
 
-    candidateInfo_list = []
-    with open('data/part2/luna/annotations_with_malignancy.csv', "r") as f:
+    diameter_dict = {}
+    with open('data/luna/annotations.csv', "r") as f:
         for row in list(csv.reader(f))[1:]:
             series_uid = row[0]
-
-            if series_uid not in presentOnDisk_set and requireOnDisk_bool:
-                continue
-
             annotationCenter_xyz = tuple([float(x) for x in row[1:4]])
             annotationDiameter_mm = float(row[4])
-            isMal_bool = {'FALSE': False, 'TRUE': True}[row[5]]
 
-            candidateInfo_list.append(CandidateInfoTuple(
-                True, # isNodule_bool
-                True, #  hasAnnotation_bool
-                isMal_bool, # is malignant
-                annotationDiameter_mm, # diameter
-                series_uid, # CT_id
-                annotationCenter_xyz #centre
-                ))
+            diameter_dict.setdefault(series_uid, []).append( # each series_uid of a CT scan has a list includes all anotations in that CT
+                (annotationCenter_xyz, annotationDiameter_mm),
+            )
 
-    with open('data/part2/luna/candidates.csv', "r") as f:
-        for row in list(csv.reader(f))[1:]:
+    #I need to check if each candidate matches any annotations based on proximity in 3D space
+    #I compare each candidate with all anootations to see if matches (are the same)
+    candidateInfo_list = []
+    with open('data/luna/candidates.csv', "r") as f:
+        for row in list(csv.reader(f))[1:]: 
             series_uid = row[0]
 
             if series_uid not in presentOnDisk_set and requireOnDisk_bool:
@@ -75,34 +61,31 @@ def getCandidateInfoList(requireOnDisk_bool=True):
             isNodule_bool = bool(int(row[4]))
             candidateCenter_xyz = tuple([float(x) for x in row[1:4]])
 
-            if not isNodule_bool:
-                candidateInfo_list.append(CandidateInfoTuple(
-                    False,
-                    False,
-                    False,
-                    0.0,
-                    series_uid,
-                    candidateCenter_xyz,
-                ))
+            candidateDiameter_mm = 0.0
+            for annotation_tup in diameter_dict.get(series_uid, []):
+                annotationCenter_xyz, annotationDiameter_mm = annotation_tup
+                for i in range(3): # iterate through the 3 dimensions x,y,z
+                    delta_mm = abs(candidateCenter_xyz[i] - annotationCenter_xyz[i])
+                    if delta_mm > annotationDiameter_mm / 4:
+                        break
+                else: #The else block in a for...else construct is executed only once, and it runs after the loop completes only if the loop completes without encountering a break.
+                    candidateDiameter_mm = annotationDiameter_mm # no break happened both candidate and annotation are the same
+                    break # exits the outer for loop (for annotation_tup in diameter_dict.get(series_uid, [])), it stops further annotation checks once a match is found.
+
+            candidateInfo_list.append(CandidateInfoTuple(
+                isNodule_bool,
+                candidateDiameter_mm,
+                series_uid,
+                candidateCenter_xyz,
+            ))
 
     candidateInfo_list.sort(reverse=True)
     return candidateInfo_list
 
-@functools.lru_cache(1)
-def getCandidateInfoDict(requireOnDisk_bool=True):
-    candidateInfo_list = getCandidateInfoList(requireOnDisk_bool)
-    candidateInfo_dict = {}
-
-    for candidateInfo_tup in candidateInfo_list:
-        candidateInfo_dict.setdefault(candidateInfo_tup.series_uid, []).append(candidateInfo_tup)
-
-    return candidateInfo_dict
-
-
 class Ct:
     def __init__(self, series_uid):
         mhd_path = glob.glob(
-            'data-unversioned/part2/luna/subset*/{}.mhd'.format(series_uid)
+            'data/luna/subset*/{}.mhd'.format(series_uid)
         )[0]
 
         ct_mhd = sitk.ReadImage(mhd_path)
@@ -122,7 +105,12 @@ class Ct:
         self.direction_a = np.array(ct_mhd.GetDirection()).reshape(3, 3)
 
     def getRawCandidate(self, center_xyz, width_irc):
-        center_irc = xyz2irc(center_xyz, self.origin_xyz, self.vxSize_xyz, self.direction_a)
+        center_irc = xyz2irc(
+            center_xyz,
+            self.origin_xyz,
+            self.vxSize_xyz,
+            self.direction_a,
+        )
 
         slice_list = []
         for axis, center_val in enumerate(center_irc):
@@ -160,35 +148,31 @@ def getCtRawCandidate(series_uid, center_xyz, width_irc):
     ct_chunk, center_irc = ct.getRawCandidate(center_xyz, width_irc)
     return ct_chunk, center_irc
 
-@raw_cache.memoize(typed=True)
-def getCtSampleSize(series_uid):
-    ct = Ct(series_uid, buildMasks_bool=False)
-    return len(ct.negative_indexes)
-
 def getCtAugmentedCandidate(
         augmentation_dict,
         series_uid, center_xyz, width_irc,
         use_cache=True):
     if use_cache:
-        ct_chunk, center_irc = getCtRawCandidate(series_uid, center_xyz, width_irc)
+        ct_chunk, center_irc = \
+            getCtRawCandidate(series_uid, center_xyz, width_irc)
     else:
         ct = getCt(series_uid)
         ct_chunk, center_irc = ct.getRawCandidate(center_xyz, width_irc)
 
-    ct_t = torch.tensor(ct_chunk).unsqueeze(0).unsqueeze(0).to(torch.float32)
+    ct_t = torch.tensor(ct_chunk).unsqueeze(0).unsqueeze(0).to(torch.float32)  # adding batch size and channel dimensions
 
-    transform_t = torch.eye(4)
+    transform_t = torch.eye(4) # creates a 4×4 identity matrix.
     # ... <1>
 
-    for i in range(3):
+    for i in range(3): # The indices (0,1,2) correspond to X, Y, and Z axes.
         if 'flip' in augmentation_dict:
             if random.random() > 0.5:
                 transform_t[i,i] *= -1
 
         if 'offset' in augmentation_dict:
             offset_float = augmentation_dict['offset']
-            random_float = (random.random() * 2 - 1)
-            transform_t[i, 3] = offset_float * random_float
+            random_float = (random.random() * 2 - 1)  # random number between -1 and 1
+            transform_t[i,3] = offset_float * random_float
 
         if 'scale' in augmentation_dict:
             scale_float = augmentation_dict['scale']
@@ -211,7 +195,7 @@ def getCtAugmentedCandidate(
         transform_t @= rotation_t
 
     affine_t = F.affine_grid(
-            transform_t[:3].unsqueeze(0).to(torch.float32),
+            transform_t[:3].unsqueeze(0).to(torch.float32), #(1,3,4)
             ct_t.size(),
             align_corners=False,
         )
@@ -253,20 +237,17 @@ class LunaDataset(Dataset):
             self.use_cache = True
 
         if series_uid:
-            self.series_list = [series_uid]
-        else:
-            self.series_list = sorted(set(candidateInfo_tup.series_uid for candidateInfo_tup in self.candidateInfo_list))
+            self.candidateInfo_list = [
+                x for x in self.candidateInfo_list if x.series_uid == series_uid
+            ]
 
         if isValSet_bool:
             assert val_stride > 0, val_stride
-            self.series_list = self.series_list[::val_stride]
-            assert self.series_list
+            self.candidateInfo_list = self.candidateInfo_list[::val_stride]
+            assert self.candidateInfo_list
         elif val_stride > 0:
-            del self.series_list[::val_stride]
-            assert self.series_list
-
-        series_set = set(self.series_list)
-        self.candidateInfo_list = [x for x in self.candidateInfo_list if x.series_uid in series_set]
+            del self.candidateInfo_list[::val_stride]
+            assert self.candidateInfo_list
 
         if sortby_str == 'random':
             random.shuffle(self.candidateInfo_list)
@@ -277,57 +258,48 @@ class LunaDataset(Dataset):
         else:
             raise Exception("Unknown sort: " + repr(sortby_str))
 
-        self.neg_list = \
-            [nt for nt in self.candidateInfo_list if not nt.isNodule_bool]
-        self.pos_list = \
-            [nt for nt in self.candidateInfo_list if nt.isNodule_bool]
-        self.ben_list = \
-            [nt for nt in self.pos_list if not nt.isMal_bool]
-        self.mal_list = \
-            [nt for nt in self.pos_list if nt.isMal_bool]
+        self.negative_list = [
+            nt for nt in self.candidateInfo_list if not nt.isNodule_bool
+        ]
+        self.pos_list = [
+            nt for nt in self.candidateInfo_list if nt.isNodule_bool
+        ]
 
         log.info("{!r}: {} {} samples, {} neg, {} pos, {} ratio".format(
             self,
             len(self.candidateInfo_list),
             "validation" if isValSet_bool else "training",
-            len(self.neg_list),
+            len(self.negative_list),
             len(self.pos_list),
             '{}:1'.format(self.ratio_int) if self.ratio_int else 'unbalanced'
         ))
 
-    def shuffleSamples(self):
+    def shuffleSamples(self): #  We will call this at the top of each epoch to randomize the order of samples being presented.
         if self.ratio_int:
-            random.shuffle(self.candidateInfo_list)
-            random.shuffle(self.neg_list)
+            random.shuffle(self.negative_list)
             random.shuffle(self.pos_list)
-            random.shuffle(self.ben_list)
-            random.shuffle(self.mal_list)
 
     def __len__(self):
         if self.ratio_int:
-            return 50000 #50000
+            return 20000 #200000  We’re no longer tied to a specific number of samples, and presenting “a full epoch”doesn’t really make sense when we would have to repeat positive samples many, manytimes to present a balanced training set.
         else:
             return len(self.candidateInfo_list)
 
-    def __getitem__(self, ndx): #for example: if ratio_int = 2, the function ensures that every three samples include one positive and two negative samples. This maintains a 2:1 negative-to-positive ratio in the dataset.
+    def __getitem__(self, ndx): #if ratio_int = 2, the function ensures that every three samples include one positive and two negative samples. This maintains a 2:1 negative-to-positive ratio in the dataset.
+
         if self.ratio_int:
             pos_ndx = ndx // (self.ratio_int + 1)
 
             if ndx % (self.ratio_int + 1):
                 neg_ndx = ndx - 1 - pos_ndx
-                neg_ndx %= len(self.neg_list)
-                candidateInfo_tup = self.neg_list[neg_ndx]
+                neg_ndx %= len(self.negative_list)
+                candidateInfo_tup = self.negative_list[neg_ndx]
             else:
                 pos_ndx %= len(self.pos_list)
                 candidateInfo_tup = self.pos_list[pos_ndx]
         else:
             candidateInfo_tup = self.candidateInfo_list[ndx]
 
-        return self.sampleFromCandidateInfo_tup(
-            candidateInfo_tup, candidateInfo_tup.isNodule_bool
-        )
-
-    def sampleFromCandidateInfo_tup(self, candidateInfo_tup, label_bool):
         width_irc = (32, 48, 48)
 
         if self.augmentation_dict:
@@ -355,39 +327,14 @@ class LunaDataset(Dataset):
             candidate_t = torch.from_numpy(candidate_a).to(torch.float32)
             candidate_t = candidate_t.unsqueeze(0)
 
-        label_t = torch.tensor([False, False], dtype=torch.long)
-
-        if not label_bool:
-            label_t[0] = True
-            index_t = 0
-        else:
-            label_t[1] = True
-            index_t = 1
-
-        return candidate_t, label_t, index_t, candidateInfo_tup.series_uid, torch.tensor(center_irc)
-
-
-class MalignantLunaDataset(LunaDataset):
-    def __len__(self):
-        if self.ratio_int:
-            return 100000
-        else:
-            return len(self.ben_list + self.mal_list)
-
-    def __getitem__(self, ndx):
-        if self.ratio_int:
-            if ndx % 2 != 0:
-                candidateInfo_tup = self.mal_list[(ndx // 2) % len(self.mal_list)]
-            elif ndx % 4 == 0:
-                candidateInfo_tup = self.ben_list[(ndx // 4) % len(self.ben_list)]
-            else:
-                candidateInfo_tup = self.neg_list[(ndx // 4) % len(self.neg_list)]
-        else:
-            if ndx >= len(self.ben_list):
-                candidateInfo_tup = self.mal_list[ndx - len(self.ben_list)]
-            else:
-                candidateInfo_tup = self.ben_list[ndx]
-
-        return self.sampleFromCandidateInfo_tup(
-            candidateInfo_tup, candidateInfo_tup.isMal_bool
+        pos_t = torch.tensor([
+                not candidateInfo_tup.isNodule_bool,
+                candidateInfo_tup.isNodule_bool
+            ],
+            dtype=torch.long,
         )
+
+        return candidate_t, pos_t, candidateInfo_tup.series_uid, torch.tensor(center_irc)
+            # #chunck tensor (1*32*48*48), label, id of the relevent CT, centre of the chunk
+
+

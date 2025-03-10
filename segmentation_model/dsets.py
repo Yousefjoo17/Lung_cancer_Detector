@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 # log.setLevel(logging.INFO)
 log.setLevel(logging.DEBUG)
 
-raw_cache = getCache('part2ch13_raw')
+raw_cache = getCache('segmentation_raw')
 
 MaskTuple = namedtuple('MaskTuple', 'raw_dense_mask, dense_mask, body_mask, air_mask, raw_candidate_mask, candidate_mask, lung_mask, neg_mask, pos_mask')
 
@@ -37,32 +37,37 @@ def getCandidateInfoList(requireOnDisk_bool=True):
     # We construct a set with all series_uids that are present on disk.
     # This will let us use the data, even if we haven't downloaded all of
     # the subsets yet.
-    mhd_list = glob.glob('data-unversioned/part2/luna/subset*/*.mhd')
+    mhd_list = glob.glob('data/luna/subset*/*.mhd')
     presentOnDisk_set = {os.path.split(p)[-1][:-4] for p in mhd_list}
 
     candidateInfo_list = []
-    with open('data/part2/luna/annotations_with_malignancy.csv', "r") as f:
+    with open('data/luna/annotations_with_malignancy.csv', "r") as f:
         for row in list(csv.reader(f))[1:]:
             series_uid = row[0]
+
+            if series_uid not in presentOnDisk_set and requireOnDisk_bool:
+                continue
+
             annotationCenter_xyz = tuple([float(x) for x in row[1:4]])
             annotationDiameter_mm = float(row[4])
-            isMal_bool = {'False': False, 'True': True}[row[5]]
+            isMal_bool = {'FALSE': False, 'TRUE': True}[row[5]]
 
             candidateInfo_list.append(
                 CandidateInfoTuple(
-                    True,
-                    True,
-                    isMal_bool,
-                    annotationDiameter_mm,
-                    series_uid,
-                    annotationCenter_xyz,
+                    True, # isNodule_bool
+                    True, #  hasAnnotation_bool
+                    isMal_bool, # is malignant
+                    annotationDiameter_mm, # diameter
+                    series_uid, # id
+                    annotationCenter_xyz, # centre
                 )
             )
 
-    with open('data/part2/luna/candidates.csv', "r") as f:
+    with open('data/luna/candidates.csv', "r") as f:
         for row in list(csv.reader(f))[1:]:
             series_uid = row[0]
-
+            
+            #log.info("Entering if condition to check {}".format(series_uid))
             if series_uid not in presentOnDisk_set and requireOnDisk_bool:
                 continue
 
@@ -97,8 +102,9 @@ def getCandidateInfoDict(requireOnDisk_bool=True):
 
 class Ct:
     def __init__(self, series_uid):
+
         mhd_path = glob.glob(
-            'data-unversioned/part2/luna/subset*/{}.mhd'.format(series_uid)
+            'data/luna/subset*/{}.mhd'.format(series_uid)
         )[0]
 
         ct_mhd = sitk.ReadImage(mhd_path)
@@ -113,19 +119,19 @@ class Ct:
         self.vxSize_xyz = XyzTuple(*ct_mhd.GetSpacing())
         self.direction_a = np.array(ct_mhd.GetDirection()).reshape(3, 3)
 
-        candidateInfo_list = getCandidateInfoDict()[self.series_uid]
+        candidateInfo_list = getCandidateInfoDict()[self.series_uid] # all candidates belonging to this CT scan
 
-        self.positiveInfo_list = [
+        self.positiveInfo_list = [ # all nodules belonging to this CT scan
             candidate_tup
             for candidate_tup in candidateInfo_list
             if candidate_tup.isNodule_bool
         ]
-        self.positive_mask = self.buildAnnotationMask(self.positiveInfo_list)
-        self.positive_indexes = (self.positive_mask.sum(axis=(1,2))
-                                 .nonzero()[0].tolist())
+        self.positive_mask = self.buildAnnotationMask(self.positiveInfo_list) #(128,512,512) for the whole CT
+        self.positive_indexes = (self.positive_mask.sum(axis=(1,2)) # Gives us a 1D vector (along the slices in the one CT) with the number of voxels flagged true in each slice
+                                 .nonzero()[0].tolist()) #Takes indices of the mask slices that have a nonzero count, which we make into a list
 
     def buildAnnotationMask(self, positiveInfo_list, threshold_hu = -700):
-        boundingBox_a = np.zeros_like(self.hu_a, dtype=np.bool)
+        boundingBox_a = np.zeros_like(self.hu_a, dtype=bool) #(128,512,512)
 
         for candidateInfo_tup in positiveInfo_list:
             center_irc = xyz2irc(
@@ -167,7 +173,7 @@ class Ct:
             # assert col_radius > 0
 
             boundingBox_a[
-                 ci - index_radius: ci + index_radius + 1,
+                 ci - index_radius: ci + index_radius + 1, # +1 because list[x:y] has elements from x to y-1
                  cr - row_radius: cr + row_radius + 1,
                  cc - col_radius: cc + col_radius + 1] = True
 
@@ -221,7 +227,7 @@ def getCtRawCandidate(series_uid, center_xyz, width_irc):
 def getCtSampleSize(series_uid):
     ct = Ct(series_uid)
     return int(ct.hu_a.shape[0]), ct.positive_indexes
-
+            #number of indices (depth),  # 1D vector (along the slices in the one CT) with the number of voxels flagged true in each slice (if number of voxels flagged true =0 it neglect the slice )
 
 class Luna2dSegmentationDataset(Dataset):
     def __init__(self,
@@ -237,7 +243,7 @@ class Luna2dSegmentationDataset(Dataset):
         if series_uid:
             self.series_list = [series_uid]
         else:
-            self.series_list = sorted(getCandidateInfoDict().keys())
+            self.series_list = sorted(getCandidateInfoDict().keys()) # having all series_uid of my all CT scans (I will update this list next)
 
         if isValSet_bool:
             assert val_stride > 0, val_stride
@@ -245,26 +251,29 @@ class Luna2dSegmentationDataset(Dataset):
             assert self.series_list
         elif val_stride > 0:
             del self.series_list[::val_stride]
-            assert self.series_list
+            assert self.series_list 
+            # Now I have updated my series list to include either training series_uid or validation series_uid
 
-        self.sample_list = []
-        for series_uid in self.series_list:
+        self.sample_list = [] # sample_list has slices of some or all CT scans 
+        for series_uid in self.series_list: # uterate through all CT scans
             index_count, positive_indexes = getCtSampleSize(series_uid)
+            #number of all indices in a CT scan,  
+            # a list of slice indices which contain at least one flagged True voxel.
 
-            if self.fullCt_bool:
+            if self.fullCt_bool: 
                 self.sample_list += [(series_uid, slice_ndx)
-                                     for slice_ndx in range(index_count)]
-            else:
+                                     for slice_ndx in range(index_count)] # eg:[('CT_1', 0), ('CT_1', 1), ('CT_1', 2), ('CT_1', 3), ('CT_1', 4),    ('CT_2', 0), ('CT_2', 1), ('CT_2', 2), ('CT_2', 3), ('CT_2', 4), ...........]
+            else: # in the code this always happens: I use positive_indexes only 
                 self.sample_list += [(series_uid, slice_ndx)
-                                     for slice_ndx in positive_indexes]
+                                     for slice_ndx in positive_indexes] # eg:[('CT_1', 0), ('CT_1', 3), ('CT_1', 4),    ('CT_2', 1), ('CT_2', 3), ('CT_2', 4), ......... ]
 
-        self.candidateInfo_list = getCandidateInfoList()
+        self.candidateInfo_list = getCandidateInfoList() #candidateInfo_list has CandidateInfoTuples(# isNodule_bool, hasAnnotation_bool, is malignant, diameter, id,centre) of all CT scans. (I will update this list next)
 
         series_set = set(self.series_list)
-        self.candidateInfo_list = [cit for cit in self.candidateInfo_list
+        self.candidateInfo_list = [cit for cit in self.candidateInfo_list # all candidates in my series_list
                                    if cit.series_uid in series_set]
 
-        self.pos_list = [nt for nt in self.candidateInfo_list
+        self.pos_list = [nt for nt in self.candidateInfo_list # all nodules in my series_list
                             if nt.isNodule_bool]
 
         log.info("{!r}: {} {} series, {} slices, {} nodules".format(
@@ -275,20 +284,26 @@ class Luna2dSegmentationDataset(Dataset):
             len(self.pos_list),
         ))
 
+    #sample_list: eg:[('CT_1', 0), ('CT_1', 3), ('CT_1', 4),    ('CT_2', 1), ('CT_2', 3), ('CT_2', 4), ......... ]
+
     def __len__(self):
         return len(self.sample_list)
-
-    def __getitem__(self, ndx):
+    
+    def __getitem__(self, ndx): 
         series_uid, slice_ndx = self.sample_list[ndx % len(self.sample_list)]
-        return self.getitem_fullSlice(series_uid, slice_ndx)
+        return self.getitem_fullSlice(series_uid, slice_ndx)# I need to know which CT scan and which slice I should return
 
+# Context Slices: The method extracts not just the target slice (slice_ndx) 
+# but also neighboring slices to provide context. This is useful for tasks like segmentation, 
+# where surrounding slices can help improve predictions. The contextSlices_count = 3 means
+#  it takes 3 slices before and 3 slices after the target slice, totaling 7 slices (3 + 1 + 3).
     def getitem_fullSlice(self, series_uid, slice_ndx):
         ct = getCt(series_uid)
         ct_t = torch.zeros((self.contextSlices_count * 2 + 1, 512, 512))
 
         start_ndx = slice_ndx - self.contextSlices_count
         end_ndx = slice_ndx + self.contextSlices_count + 1
-        for i, context_ndx in enumerate(range(start_ndx, end_ndx)):
+        for i, context_ndx in enumerate(range(start_ndx, end_ndx)): # handle edge cases. start=3 -> slcie_index=6 -> end=10
             context_ndx = max(context_ndx, 0)
             context_ndx = min(context_ndx, ct.hu_a.shape[0] - 1)
             ct_t[i] = torch.from_numpy(ct.hu_a[context_ndx].astype(np.float32))
@@ -299,9 +314,11 @@ class Luna2dSegmentationDataset(Dataset):
         # The upper bound nukes any weird hotspots and clamps bone down
         ct_t.clamp_(-1000, 1000)
 
-        pos_t = torch.from_numpy(ct.positive_mask[slice_ndx]).unsqueeze(0)
+        pos_t = torch.from_numpy(ct.positive_mask[slice_ndx]).unsqueeze(0) #(1,512,512)
 
-        return ct_t, pos_t, ct.series_uid, slice_ndx
+        return ct_t, pos_t, ct.series_uid, slice_ndx 
+            # (7,512,512), (1,512,512)
+            # The item is a speciifc slice (with 6 neighbours) in a CT scan.
 
 
 class TrainingLuna2dSegmentationDataset(Luna2dSegmentationDataset):
@@ -311,7 +328,7 @@ class TrainingLuna2dSegmentationDataset(Luna2dSegmentationDataset):
         self.ratio_int = 2
 
     def __len__(self):
-        return 300000
+        return 50000 # It was 30,000
 
     def shuffleSamples(self):
         random.shuffle(self.candidateInfo_list)
@@ -327,18 +344,19 @@ class TrainingLuna2dSegmentationDataset(Luna2dSegmentationDataset):
             candidateInfo_tup.center_xyz,
             (7, 96, 96),
         )
-        pos_a = pos_a[3:4]
-
+        pos_a = pos_a[3:4] #(1,96,96) I get the middle slice, if I made pos_a = pos_a[3] I will lose the first dimension
+ 
         row_offset = random.randrange(0,32)
         col_offset = random.randrange(0,32)
         ct_t = torch.from_numpy(ct_a[:, row_offset:row_offset+64,
-                                     col_offset:col_offset+64]).to(torch.float32)
+                                    col_offset:col_offset+64]).to(torch.float32)
         pos_t = torch.from_numpy(pos_a[:, row_offset:row_offset+64,
-                                       col_offset:col_offset+64]).to(torch.long)
+                                    col_offset:col_offset+64]).to(torch.long)
 
         slice_ndx = center_irc.index
 
         return ct_t, pos_t, candidateInfo_tup.series_uid, slice_ndx
+            #(7,64,64), label : (1,64,64), series_uid, slice index
 
 class PrepcacheLunaDataset(Dataset):
     def __init__(self, *args, **kwargs):

@@ -67,30 +67,32 @@ class SegmentationAugmentation(nn.Module):
 
     def forward(self, input_g, label_g):
         transform_t = self._build2dTransformMatrix()
-        transform_t = transform_t.expand(input_g.shape[0], -1, -1)
-        transform_t = transform_t.to(input_g.device, torch.float32)
-        affine_t = F.affine_grid(transform_t[:,:2],
-                input_g.size(), align_corners=False)
+        transform_t = transform_t.expand(input_g.shape[0], -1, -1) #PyTorch repeats the matrix transform_t along the first dimension (batch dimension) n times
+        transform_t = transform_t.to(input_g.device, torch.float32) # this moves the tensor transform_t from the CPU (default) to the GPU's memory.
+        affine_t = F.affine_grid(transform_t[:,:2], #The first dimension of the transformation is the batch, but we only want the first two rows of the 3 × 3 matrices per batch item
+                input_g.size(), align_corners=False) # I could use input_g.shape but size is commonly used in PyTorch functions,
 
         augmented_input_g = F.grid_sample(input_g,
                 affine_t, padding_mode='border',
                 align_corners=False)
         augmented_label_g = F.grid_sample(label_g.to(torch.float32),
                 affine_t, padding_mode='border',
-                align_corners=False)
+                align_corners=False) # We need the same transformation applied to CT and 
+                                     # mask, so we use the same grid. Because grid_sample 
+                                     # only works with floats, we convert here.
 
         if self.noise:
-            noise_t = torch.randn_like(augmented_input_g)
+            noise_t = torch.randn_like(augmented_input_g) # generates a tensor of the same shape as augmented_input_g with random values sampled from a standard normal distribution (mean = 0, standard deviation = 1).
             noise_t *= self.noise
 
             augmented_input_g += noise_t
 
-        return augmented_input_g, augmented_label_g > 0.5
+        return augmented_input_g, augmented_label_g > 0.5 # convert the mask back to Booleans by comparing to 0.5. The interpolation that grid_sample results in fractional values.
 
     def _build2dTransformMatrix(self):
-        transform_t = torch.eye(3)
+        transform_t = torch.eye(3) # identity 3*3 matrix but we will drop the last row later.
 
-        for i in range(2):
+        for i in range(2): # row and column
             if self.flip:
                 if random.random() > 0.5:
                     transform_t[i,i] *= -1

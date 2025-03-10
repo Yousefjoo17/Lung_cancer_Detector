@@ -1,14 +1,14 @@
-import matplotlib
-matplotlib.use('nbagg')
+# import matplotlib
+# matplotlib.use('nbagg')
 
 import numpy as np
 import matplotlib.pyplot as plt
 
-from classification_model.dsets import Ct, LunaDataset
+from p2ch12.dsets import Ct, LunaDataset
 
 clim=(-1000.0, 300)
 
-def findPositiveSamples(start_ndx=0, limit=100):
+def findPositiveSamples(start_ndx=0, limit=10):
     ds = LunaDataset(sortby_str='label_and_size')
 
     positiveSample_list = []

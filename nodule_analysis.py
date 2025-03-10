@@ -180,7 +180,7 @@ class NoduleAnalysisApp:
 
     def initModelPath(self, type_str):
         local_path = os.path.join(
-            'data-unversioned',
+            'data',
             'part2',
             'models',
             'segmentation_model',#self.cli_args.tb_prefix,
